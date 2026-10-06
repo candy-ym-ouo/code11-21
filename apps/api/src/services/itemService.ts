@@ -1,18 +1,17 @@
-import type { FamilyRole, Item, Prisma } from '@prisma/client';
+import type { Item, Prisma } from '@prisma/client';
 import { sortAt as computeSortAt, timelineGroupKey, type Category, type Precision, type Visibility } from '@heirloom/shared';
 import { prisma } from '../db';
-import { badRequest, conflict, forbidden, notFound } from '../http/errors';
+import { badRequest, conflict, notFound } from '../http/errors';
 import { cleanStory } from '../utils/sanitize';
 import { toPage, type CursorPage } from '../utils/pagination';
 import * as audit from './auditService';
-import { itemWithAccess, type FamilyContext } from './permissionService';
+import { inUnit, type ActorMeta } from './unitOfWork';
+import { appendItemVersion, toVersionSnapshot } from './versioning';
+import { assertCan, itemWithAccess, type FamilyContext } from './permissionService';
 import { toItemDto } from '../serializers';
 import { itemVisibilityWhere } from './visibility';
 
-export interface ActorMeta {
-  ip?: string | null;
-  userAgent?: string | null;
-}
+export type { ActorMeta } from './unitOfWork';
 
 export interface ItemInput {
   title?: string;
@@ -196,8 +195,9 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
 
   const family = await prisma.family.findUniqueOrThrow({ where: { id: ctx.familyId } });
 
-  return prisma.$transaction(async (tx) => {
-    const created = await tx.item.create({
+  const created = await inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const { tx } = uow;
+    const item = await tx.item.create({
       data: {
         familyId: ctx.familyId,
         title: input.title!,
@@ -231,47 +231,17 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
       include: LIST_INCLUDE,
     });
 
-    await tx.itemVersion.create({
-      data: { itemId: created.id, version: 1, snapshot: toVersionSnapshot(created), createdBy: userId },
+    await appendItemVersion(uow, item, userId);
+    await uow.audit({
+      action: 'item.create',
+      targetType: 'item',
+      targetId: item.id,
+      diff: { title: item.title, category: item.category } as Prisma.InputJsonValue,
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'item.create',
-        targetType: 'item',
-        targetId: created.id,
-        diff: { title: created.title, category: created.category } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
-    return toItemDto(created, ctx.familyId);
+    return item;
   });
-}
 
-export function toVersionSnapshot(item: Item): Prisma.InputJsonValue {
-  return {
-    title: item.title,
-    category: item.category,
-    status: item.status,
-    visibility: item.visibility,
-    acquiredAt: item.acquiredAt?.toISOString() ?? null,
-    acquiredPrecision: item.acquiredPrecision,
-    acquiredLabel: item.acquiredLabel,
-    acquiredNote: item.acquiredNote,
-    placeText: item.placeText,
-    placeCity: item.placeCity,
-    placeProvince: item.placeProvince,
-    placeCountry: item.placeCountry,
-    placeLat: item.placeLat ? Number(item.placeLat) : null,
-    placeLng: item.placeLng ? Number(item.placeLng) : null,
-    storyHtml: item.storyHtml,
-    condition: item.condition,
-    storageLocation: item.storageLocation,
-    tags: item.tags,
-    coverMediaId: item.coverMediaId,
-  } as unknown as Prisma.InputJsonValue;
+  return toItemDto(created, ctx.familyId);
 }
 
 export async function updateItem(
@@ -282,7 +252,7 @@ export async function updateItem(
   meta: ActorMeta,
 ) {
   const { item, access } = await itemWithAccess(userId, ctx, itemId);
-  if (!access.canEdit) throw forbidden();
+  assertCan(access, 'canEdit');
   if (item.status === 'trashed') throw conflict('回收站中的条目不可编辑，请先恢复');
 
   await assertPeopleBelongToFamily(ctx.familyId, (input.people ?? []).map((p) => p.personId));
@@ -297,7 +267,8 @@ export async function updateItem(
       ? item.sortAt
       : computeSortAt({ acquiredAt: nextAcquiredAt, acquiredPrecision: nextPrecision }, new Date());
 
-  return prisma.$transaction(async (tx) => {
+  return inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const { tx } = uow;
     const updated = await tx.item.update({
       where: { id: itemId },
       data: {
@@ -340,27 +311,13 @@ export async function updateItem(
       }
     }
 
-    const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
-    await tx.itemVersion.create({
-      data: {
-        itemId,
-        version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
-        createdBy: userId,
-      },
+    await appendItemVersion(uow, updated, userId);
+    await uow.audit({
+      action: 'item.update',
+      targetType: 'item',
+      targetId: itemId,
+      diff: audit.diffOf(toVersionSnapshot(item), toVersionSnapshot(updated)),
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'item.update',
-        targetType: 'item',
-        targetId: itemId,
-        diff: audit.diffOf(toVersionSnapshot(item), toVersionSnapshot(updated)),
-        ...meta,
-      },
-      tx,
-    );
 
     const withRelations = await tx.item.findUniqueOrThrow({ where: { id: itemId }, include: LIST_INCLUDE });
     return toItemDto(withRelations, ctx.familyId);
@@ -385,12 +342,10 @@ export async function changeStatus(
 ) {
   const { item, access } = await itemWithAccess(userId, ctx, itemId);
 
-  if (action === 'trash') {
-    if (!access.canDelete) throw forbidden();
-  } else if (action === 'restore') {
-    if (!access.canDelete) throw forbidden();
-  } else if (!access.canEdit) {
-    throw forbidden();
+  if (action === 'trash' || action === 'restore') {
+    assertCan(access, 'canDelete');
+  } else {
+    assertCan(access, 'canEdit');
   }
 
   if (action === 'publish') {
@@ -402,24 +357,18 @@ export async function changeStatus(
   }
 
   const target = STATUS_TARGET[action];
-  const updated = await prisma.$transaction(async (tx) => {
-    const result = await tx.item.update({
+  const updated = await inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const result = await uow.tx.item.update({
       where: { id: itemId },
       data: { status: target, deletedAt: action === 'trash' ? new Date() : null },
       include: LIST_INCLUDE,
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: `item.${action}` as string,
-        targetType: 'item',
-        targetId: itemId,
-        diff: audit.diffOf({ status: item.status }, { status: target }),
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: `item.${action}`,
+      targetType: 'item',
+      targetId: itemId,
+      diff: audit.diffOf({ status: item.status }, { status: target }),
+    });
     return result;
   });
   return toItemDto(updated, ctx.familyId);
@@ -432,20 +381,14 @@ export async function purgeItem(userId: string, ctx: FamilyContext, itemId: stri
   if (item.status !== 'trashed') throw conflict('只有回收站中的条目才能彻底删除');
 
   const media = await prisma.itemMedia.findMany({ where: { itemId } });
-  await prisma.$transaction(async (tx) => {
-    await tx.item.delete({ where: { id: itemId } });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'item.purge',
-        targetType: 'item',
-        targetId: itemId,
-        diff: { title: item.title, mediaCount: media.length } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+  await inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    await uow.tx.item.delete({ where: { id: itemId } });
+    await uow.audit({
+      action: 'item.purge',
+      targetType: 'item',
+      targetId: itemId,
+      diff: { title: item.title, mediaCount: media.length } as Prisma.InputJsonValue,
+    });
   });
   return media.flatMap((m) => [m.storageKey, m.thumbKey, m.largeKey, m.transcodeKey, m.waveformKey].filter(Boolean) as string[]);
 }
@@ -483,15 +426,15 @@ export async function revertVersion(
   meta: ActorMeta,
 ) {
   const { access } = await itemWithAccess(userId, ctx, itemId);
-  if (!access.canEdit) throw forbidden();
+  assertCan(access, 'canEdit');
   const version = await prisma.itemVersion.findFirst({ where: { id: versionId, itemId } });
   if (!version) throw notFound('版本不存在');
 
   const snap = version.snapshot as Record<string, unknown>;
   const story = cleanStory(typeof snap.storyHtml === 'string' ? snap.storyHtml : null);
 
-  return prisma.$transaction(async (tx) => {
-    const updated = await tx.item.update({
+  return inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const updated = await uow.tx.item.update({
       where: { id: itemId },
       data: {
         title: snap.title as string,
@@ -520,27 +463,13 @@ export async function revertVersion(
       },
       include: LIST_INCLUDE,
     });
-    const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
-    await tx.itemVersion.create({
-      data: {
-        itemId,
-        version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
-        createdBy: userId,
-      },
+    await appendItemVersion(uow, updated, userId);
+    await uow.audit({
+      action: 'item.revert',
+      targetType: 'item',
+      targetId: itemId,
+      diff: { revertedTo: version.version } as Prisma.InputJsonValue,
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'item.revert',
-        targetType: 'item',
-        targetId: itemId,
-        diff: { revertedTo: version.version } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
     return toItemDto(updated, ctx.familyId);
   });
 }

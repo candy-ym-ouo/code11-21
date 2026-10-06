@@ -1,9 +1,10 @@
 import { argon2Verify, argon2id } from 'hash-wasm';
-import type { Prisma, User } from '@prisma/client';
+import type { User } from '@prisma/client';
 import { prisma } from '../db';
 import { conflict, unauthenticated, badRequest } from '../http/errors';
 import { randomBytes } from 'node:crypto';
 import * as audit from './auditService';
+import { inUnit } from './unitOfWork';
 
 export interface PublicUser {
   id: string;
@@ -62,8 +63,8 @@ export async function register(
   const colors = ['#2F4858', '#A44A3F', '#3F6B4A', '#6B4E71', '#8A6D3B'];
   const avatarColor = colors[userCount % colors.length]!;
 
-  const user = await prisma.$transaction(async (tx) => {
-    const created = await tx.user.create({
+  const user = await inUnit({ meta: { ip: meta.ip, userAgent: meta.userAgent } }, async (uow) => {
+    const created = await uow.tx.user.create({
       data: {
         email: input.email,
         passwordHash,
@@ -72,18 +73,13 @@ export async function register(
         systemRole: isFirstUser ? 'sysadmin' : 'user',
       },
     });
-    await audit.record(
-      {
-        actorId: created.id,
-        action: 'auth.register',
-        targetType: 'user',
-        targetId: created.id,
-        diff: { firstUser: isFirstUser } as Prisma.InputJsonValue,
-        ip: meta.ip,
-        userAgent: meta.userAgent,
-      },
-      tx,
-    );
+    await uow.audit({
+      actorId: created.id,
+      action: 'auth.register',
+      targetType: 'user',
+      targetId: created.id,
+      diff: { firstUser: isFirstUser },
+    });
     return created;
   });
 
@@ -138,8 +134,8 @@ export async function updateProfile(
     passwordHash = await hashPassword(input.newPassword);
   }
 
-  return prisma.$transaction(async (tx) => {
-    const updated = await tx.user.update({
+  return inUnit({ actorId: userId }, async (uow) => {
+    const updated = await uow.tx.user.update({
       where: { id: userId },
       data: {
         displayName: input.displayName ?? undefined,
@@ -148,7 +144,7 @@ export async function updateProfile(
       },
     });
     if (passwordHash) {
-      await tx.refreshToken.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
+      await uow.tx.refreshToken.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
     }
     return updated;
   });

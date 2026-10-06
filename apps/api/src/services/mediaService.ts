@@ -4,18 +4,15 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import type { ItemMedia } from '@prisma/client';
 import { prisma } from '../db';
-import { AppError, badRequest, notFound, conflict } from '../http/errors';
+import { AppError, badRequest, forbidden, notFound, conflict } from '../http/errors';
 import { config } from '../config';
 import { objectKey, exists, moveIntoPlace, remove, statObject, tmpDir } from '../storage/local';
 import { detectFileType, limitForKind } from '../media/sniff';
 import { toMediaDto } from '../serializers';
-import * as audit from './auditService';
+import { inUnit, type ActorMeta } from './unitOfWork';
 import { itemWithAccess, type FamilyContext } from './permissionService';
 
-export interface ActorMeta {
-  ip?: string | null;
-  userAgent?: string | null;
-}
+export type { ActorMeta } from './unitOfWork';
 
 async function sha256File(filePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -44,7 +41,7 @@ export async function uploadMedia(
   const { item, access } = await itemWithAccess(userId, ctx, itemId);
   if (!access.canManageMedia) {
     await fsp.rm(file.path, { force: true });
-    throw new AppError('FORBIDDEN', '没有权限为该条目上传媒体');
+    throw forbidden('没有权限为该条目上传媒体');
   }
 
   const detected = await detectFileType(file.path);
@@ -70,7 +67,8 @@ export async function uploadMedia(
   const maxSort = await prisma.itemMedia.aggregate({ where: { itemId }, _max: { sortOrder: true } });
   const isFirstImage = detected.kind === 'image' && !item.coverMediaId;
 
-  const media = await prisma.$transaction(async (tx) => {
+  const media = await inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const { tx } = uow;
     const created = await tx.itemMedia.create({
       data: {
         itemId,
@@ -97,18 +95,12 @@ export async function uploadMedia(
         payload: { mediaId: created.id } as never,
       },
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'media.upload',
-        targetType: 'item',
-        targetId: itemId,
-        diff: { mediaId: created.id, kind: detected.kind, bytes: file.size, sha256: sha } as never,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'media.upload',
+      targetType: 'item',
+      targetId: itemId,
+      diff: { mediaId: created.id, kind: detected.kind, bytes: file.size, sha256: sha } as never,
+    });
     return created;
   });
 
@@ -133,10 +125,10 @@ export async function updateMedia(
 ) {
   const media = await loadMediaForUser(userId, ctx, mediaId);
   const { access } = await itemWithAccess(userId, ctx, media.itemId);
-  if (!access.canManageMedia) throw new AppError('FORBIDDEN', '没有权限修改该媒体');
+  if (!access.canManageMedia) throw forbidden('没有权限修改该媒体');
 
-  const updated = await prisma.$transaction(async (tx) => {
-    const result = await tx.itemMedia.update({
+  const updated = await inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const result = await uow.tx.itemMedia.update({
       where: { id: mediaId },
       data: {
         caption: input.caption === undefined ? undefined : input.caption,
@@ -146,20 +138,14 @@ export async function updateMedia(
     });
     if (input.setCover) {
       if (result.kind !== 'image') throw badRequest('只有图片可以设为封面');
-      await tx.item.update({ where: { id: media.itemId }, data: { coverMediaId: mediaId } });
+      await uow.tx.item.update({ where: { id: media.itemId }, data: { coverMediaId: mediaId } });
     }
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'media.update',
-        targetType: 'item',
-        targetId: media.itemId,
-        diff: { mediaId, fields: Object.keys(input) } as never,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'media.update',
+      targetType: 'item',
+      targetId: media.itemId,
+      diff: { mediaId, fields: Object.keys(input) } as never,
+    });
     return result;
   });
   return toMediaDto(updated, ctx.familyId);
@@ -168,9 +154,10 @@ export async function updateMedia(
 export async function softDeleteMedia(userId: string, ctx: FamilyContext, mediaId: string, meta: ActorMeta) {
   const media = await loadMediaForUser(userId, ctx, mediaId);
   const { access } = await itemWithAccess(userId, ctx, media.itemId);
-  if (!access.canManageMedia) throw new AppError('FORBIDDEN', '没有权限删除该媒体');
+  if (!access.canManageMedia) throw forbidden('没有权限删除该媒体');
 
-  await prisma.$transaction(async (tx) => {
+  await inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const { tx } = uow;
     await tx.itemMedia.update({ where: { id: mediaId }, data: { deletedAt: new Date() } });
     const item = await tx.item.findUniqueOrThrow({ where: { id: media.itemId } });
     if (item.coverMediaId === mediaId) {
@@ -180,18 +167,12 @@ export async function softDeleteMedia(userId: string, ctx: FamilyContext, mediaI
       });
       await tx.item.update({ where: { id: media.itemId }, data: { coverMediaId: next?.id ?? null } });
     }
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'media.delete',
-        targetType: 'item',
-        targetId: media.itemId,
-        diff: { mediaId } as never,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'media.delete',
+      targetType: 'item',
+      targetId: media.itemId,
+      diff: { mediaId } as never,
+    });
   });
 }
 

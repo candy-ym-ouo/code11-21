@@ -1,15 +1,13 @@
-import type { Prisma } from '@prisma/client';
+import type { Person, Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { conflict, notFound } from '../http/errors';
 import * as audit from './auditService';
+import { inUnit, type ActorMeta } from './unitOfWork';
 import { toItemDto, toPersonDto } from '../serializers';
 import type { FamilyContext } from './permissionService';
 import { itemVisibilityWhere } from './visibility';
 
-export interface ActorMeta {
-  ip?: string | null;
-  userAgent?: string | null;
-}
+export type { ActorMeta } from './unitOfWork';
 
 export interface PersonInput {
   name: string;
@@ -18,6 +16,15 @@ export interface PersonInput {
   deathYear?: number | null;
   bio?: string | null;
   avatarMediaId?: string | null;
+}
+
+/** 读取家庭内未删除的人物；不存在一律 404。条件与各写路径原先的查询保持一致。 */
+async function loadActivePerson(familyId: string, personId: string): Promise<Person> {
+  const person = await prisma.person.findFirst({
+    where: { id: personId, familyId, deletedAt: null },
+  });
+  if (!person) throw notFound('人物不存在');
+  return person;
 }
 
 export async function listPeople(ctx: FamilyContext, q?: string) {
@@ -66,8 +73,8 @@ export async function getPerson(userId: string, ctx: FamilyContext, personId: st
 }
 
 export async function createPerson(actorId: string, ctx: FamilyContext, input: PersonInput, meta: ActorMeta) {
-  const person = await prisma.$transaction(async (tx) => {
-    const created = await tx.person.create({
+  const person = await inUnit({ familyId: ctx.familyId, actorId, meta }, async (uow) => {
+    const created = await uow.tx.person.create({
       data: {
         familyId: ctx.familyId,
         name: input.name,
@@ -80,18 +87,12 @@ export async function createPerson(actorId: string, ctx: FamilyContext, input: P
       },
       include: { _count: { select: { links: true } } },
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId,
-        action: 'person.create',
-        targetType: 'person',
-        targetId: created.id,
-        diff: { name: created.name } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'person.create',
+      targetType: 'person',
+      targetId: created.id,
+      diff: { name: created.name } as Prisma.InputJsonValue,
+    });
     return created;
   });
   return toPersonDto(person);
@@ -104,11 +105,10 @@ export async function updatePerson(
   input: Partial<PersonInput>,
   meta: ActorMeta,
 ) {
-  const before = await prisma.person.findFirst({ where: { id: personId, familyId: ctx.familyId, deletedAt: null } });
-  if (!before) throw notFound('人物不存在');
+  const before = await loadActivePerson(ctx.familyId, personId);
 
-  const person = await prisma.$transaction(async (tx) => {
-    const updated = await tx.person.update({
+  const person = await inUnit({ familyId: ctx.familyId, actorId, meta }, async (uow) => {
+    const updated = await uow.tx.person.update({
       where: { id: personId },
       data: {
         name: input.name ?? undefined,
@@ -120,26 +120,19 @@ export async function updatePerson(
       },
       include: { _count: { select: { links: true } } },
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId,
-        action: 'person.update',
-        targetType: 'person',
-        targetId: personId,
-        diff: audit.diffOf({ name: before.name, relation: before.relation }, { name: updated.name, relation: updated.relation }),
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'person.update',
+      targetType: 'person',
+      targetId: personId,
+      diff: audit.diffOf({ name: before.name, relation: before.relation }, { name: updated.name, relation: updated.relation }),
+    });
     return updated;
   });
   return toPersonDto(person);
 }
 
 export async function deletePerson(actorId: string, ctx: FamilyContext, personId: string, meta: ActorMeta) {
-  const person = await prisma.person.findFirst({ where: { id: personId, familyId: ctx.familyId, deletedAt: null } });
-  if (!person) throw notFound('人物不存在');
+  const person = await loadActivePerson(ctx.familyId, personId);
 
   const linkCount = await prisma.itemPerson.count({ where: { personId } });
   if (linkCount > 0) {
@@ -147,20 +140,14 @@ export async function deletePerson(actorId: string, ctx: FamilyContext, personId
     throw conflict(`该人物已被 ${linkCount} 个条目引用，请改用「合并到其他人物」`, { linkCount });
   }
 
-  await prisma.$transaction(async (tx) => {
-    await tx.person.update({ where: { id: personId }, data: { deletedAt: new Date() } });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId,
-        action: 'person.delete',
-        targetType: 'person',
-        targetId: personId,
-        diff: { name: person.name } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+  await inUnit({ familyId: ctx.familyId, actorId, meta }, async (uow) => {
+    await uow.tx.person.update({ where: { id: personId }, data: { deletedAt: new Date() } });
+    await uow.audit({
+      action: 'person.delete',
+      targetType: 'person',
+      targetId: personId,
+      diff: { name: person.name } as Prisma.InputJsonValue,
+    });
   });
 }
 
@@ -173,12 +160,12 @@ export async function mergePerson(
 ) {
   if (sourceId === targetId) throw conflict('不能合并到自己');
   const [source, target] = await Promise.all([
-    prisma.person.findFirst({ where: { id: sourceId, familyId: ctx.familyId, deletedAt: null } }),
-    prisma.person.findFirst({ where: { id: targetId, familyId: ctx.familyId, deletedAt: null } }),
+    loadActivePerson(ctx.familyId, sourceId),
+    loadActivePerson(ctx.familyId, targetId),
   ]);
-  if (!source || !target) throw notFound('人物不存在');
 
-  await prisma.$transaction(async (tx) => {
+  await inUnit({ familyId: ctx.familyId, actorId, meta }, async (uow) => {
+    const { tx } = uow;
     const links = await tx.itemPerson.findMany({ where: { personId: sourceId } });
     for (const link of links) {
       const existing = await tx.itemPerson.findUnique({
@@ -191,18 +178,12 @@ export async function mergePerson(
       }
     }
     await tx.person.update({ where: { id: sourceId }, data: { deletedAt: new Date(), mergedIntoId: targetId } });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId,
-        action: 'person.merge',
-        targetType: 'person',
-        targetId,
-        diff: { mergedFrom: sourceId } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'person.merge',
+      targetType: 'person',
+      targetId,
+      diff: { mergedFrom: sourceId } as Prisma.InputJsonValue,
+    });
   });
 
   return getPerson(actorId, ctx, targetId);

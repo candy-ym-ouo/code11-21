@@ -1,16 +1,12 @@
-import type { Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { conflict, forbidden, notFound } from '../http/errors';
 import { cleanStory, escapeHtml } from '../utils/sanitize';
-import * as audit from './auditService';
-import { itemWithAccess, type FamilyContext } from './permissionService';
+import { inUnit, type ActorMeta } from './unitOfWork';
+import { appendItemVersion } from './versioning';
+import { assertCan, itemWithAccess, type FamilyContext } from './permissionService';
 import { toNoteDto } from '../serializers';
-import { toVersionSnapshot } from './itemService';
 
-export interface ActorMeta {
-  ip?: string | null;
-  userAgent?: string | null;
-}
+export type { ActorMeta } from './unitOfWork';
 
 export async function listNotes(userId: string, ctx: FamilyContext, itemId: string) {
   await itemWithAccess(userId, ctx, itemId);
@@ -36,23 +32,17 @@ export async function createNote(
   if (!allowed) throw forbidden('你没有权限在这里补充内容');
   if (item.status !== 'published') throw conflict('只有已发布的条目才能补充故事');
 
-  const note = await prisma.$transaction(async (tx) => {
-    const created = await tx.itemNote.create({
+  const note = await inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const created = await uow.tx.itemNote.create({
       data: { itemId, authorId: userId, type: input.type, body: input.body },
       include: { author: { select: { id: true, displayName: true, avatarColor: true } } },
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'note.create',
-        targetType: 'item',
-        targetId: itemId,
-        diff: { noteId: created.id, type: input.type } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'note.create',
+      targetType: 'item',
+      targetId: itemId,
+      diff: { noteId: created.id, type: input.type },
+    });
     return created;
   });
   return toNoteDto(note);
@@ -66,7 +56,7 @@ export async function acceptNote(
   meta: ActorMeta,
 ) {
   const { item, access } = await itemWithAccess(userId, ctx, itemId);
-  if (!access.canEdit) throw forbidden();
+  assertCan(access, 'canEdit');
 
   const note = await prisma.itemNote.findFirst({
     where: { id: noteId, itemId },
@@ -78,37 +68,23 @@ export async function acceptNote(
   const addition = `<p><strong>${escapeHtml(note.author.displayName)}：</strong>${escapeHtml(note.body)}</p>`;
   const merged = cleanStory(`${item.storyHtml ?? ''}${addition}`);
 
-  return prisma.$transaction(async (tx) => {
-    const updatedItem = await tx.item.update({
+  return inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const updatedItem = await uow.tx.item.update({
       where: { id: itemId },
       data: { storyHtml: merged.html, storyText: merged.text || null },
     });
-    const updatedNote = await tx.itemNote.update({
+    const updatedNote = await uow.tx.itemNote.update({
       where: { id: noteId },
       data: { status: 'accepted', decidedBy: userId, decidedAt: new Date() },
       include: { author: { select: { id: true, displayName: true, avatarColor: true } } },
     });
-    const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
-    await tx.itemVersion.create({
-      data: {
-        itemId,
-        version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updatedItem),
-        createdBy: userId,
-      },
+    await appendItemVersion(uow, updatedItem, userId);
+    await uow.audit({
+      action: 'note.accept',
+      targetType: 'item',
+      targetId: itemId,
+      diff: { noteId },
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'note.accept',
-        targetType: 'item',
-        targetId: itemId,
-        diff: { noteId } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
     return toNoteDto(updatedNote);
   });
 }
@@ -122,28 +98,22 @@ export async function rejectNote(
   meta: ActorMeta,
 ) {
   const { access } = await itemWithAccess(userId, ctx, itemId);
-  if (!access.canEdit) throw forbidden();
+  assertCan(access, 'canEdit');
   const note = await prisma.itemNote.findFirst({ where: { id: noteId, itemId } });
   if (!note) throw notFound('补充内容不存在');
 
-  const updated = await prisma.$transaction(async (tx) => {
-    const result = await tx.itemNote.update({
+  const updated = await inUnit({ familyId: ctx.familyId, actorId: userId, meta }, async (uow) => {
+    const result = await uow.tx.itemNote.update({
       where: { id: noteId },
       data: { status: 'rejected', rejectReason: reason, decidedBy: userId, decidedAt: new Date() },
       include: { author: { select: { id: true, displayName: true, avatarColor: true } } },
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'note.reject',
-        targetType: 'item',
-        targetId: itemId,
-        diff: { noteId, reason } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'note.reject',
+      targetType: 'item',
+      targetId: itemId,
+      diff: { noteId, reason },
+    });
     return result;
   });
   return toNoteDto(updated);
