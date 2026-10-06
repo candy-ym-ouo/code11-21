@@ -1,15 +1,13 @@
-import type { FamilyRole, Prisma } from '@prisma/client';
+import type { FamilyRole, Invite, Prisma } from '@prisma/client';
 import { canAssignRole, canManageMember } from '@heirloom/shared';
 import { prisma } from '../db';
 import { badRequest, conflict, forbidden, notFound } from '../http/errors';
 import { randomToken, sha256Hex } from '../utils/crypto';
-import * as audit from './auditService';
+import { diffOf } from './auditService';
+import { withUnitOfWork, assertFound, type ActorMeta } from './unitOfWork';
 import { toMemberDto } from '../serializers';
 
-export interface ActorMeta {
-  ip?: string | null;
-  userAgent?: string | null;
-}
+export type { ActorMeta };
 
 export const familyDetailInclude = {
   _count: { select: { members: true, items: true, people: true } },
@@ -20,8 +18,8 @@ export async function createFamily(
   input: { name: string; description?: string | null; defaultVisibility?: 'private' | 'family' | 'selected' | 'link' },
   meta: ActorMeta,
 ) {
-  return prisma.$transaction(async (tx) => {
-    const family = await tx.family.create({
+  return withUnitOfWork({ actorId: userId }, async (uow) => {
+    const family = await uow.tx.family.create({
       data: {
         name: input.name,
         description: input.description ?? null,
@@ -29,19 +27,15 @@ export async function createFamily(
         createdBy: userId,
       },
     });
-    await tx.familyMember.create({ data: { familyId: family.id, userId, role: 'owner' } });
-    await audit.record(
-      {
-        familyId: family.id,
-        actorId: userId,
-        action: 'family.create',
-        targetType: 'family',
-        targetId: family.id,
-        diff: { name: family.name } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.tx.familyMember.create({ data: { familyId: family.id, userId, role: 'owner' } });
+    await uow.audit({
+      familyId: family.id,
+      action: 'family.create',
+      targetType: 'family',
+      targetId: family.id,
+      diff: { name: family.name } as Prisma.InputJsonValue,
+      ...meta,
+    });
     return family;
   });
 }
@@ -62,8 +56,8 @@ export async function updateFamily(
   meta: ActorMeta,
 ) {
   const before = await getFamilyDetail(familyId);
-  return prisma.$transaction(async (tx) => {
-    const updated = await tx.family.update({
+  return withUnitOfWork({ familyId, actorId }, async (uow) => {
+    const updated = await uow.tx.family.update({
       where: { id: familyId },
       data: {
         name: input.name ?? undefined,
@@ -72,21 +66,16 @@ export async function updateFamily(
         allowViewerComment: input.allowViewerComment ?? undefined,
       },
     });
-    await audit.record(
-      {
-        familyId,
-        actorId,
-        action: 'family.update',
-        targetType: 'family',
-        targetId: familyId,
-        diff: audit.diffOf(
-          { name: before.name, description: before.description, defaultVisibility: before.defaultVisibility },
-          { name: updated.name, description: updated.description, defaultVisibility: updated.defaultVisibility },
-        ),
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'family.update',
+      targetType: 'family',
+      targetId: familyId,
+      diff: diffOf(
+        { name: before.name, description: before.description, defaultVisibility: before.defaultVisibility },
+        { name: updated.name, description: updated.description, defaultVisibility: updated.defaultVisibility },
+      ),
+      ...meta,
+    });
     return updated;
   });
 }
@@ -94,12 +83,9 @@ export async function updateFamily(
 export async function deleteFamily(actorId: string, familyId: string, confirmName: string, meta: ActorMeta) {
   const family = await getFamilyDetail(familyId);
   if (family.name !== confirmName) throw badRequest('家庭名不匹配，删除已取消');
-  await prisma.$transaction(async (tx) => {
-    await tx.family.update({ where: { id: familyId }, data: { deletedAt: new Date() } });
-    await audit.record(
-      { familyId, actorId, action: 'family.delete', targetType: 'family', targetId: familyId, ...meta },
-      tx,
-    );
+  await withUnitOfWork({ familyId, actorId }, async (uow) => {
+    await uow.tx.family.update({ where: { id: familyId }, data: { deletedAt: new Date() } });
+    await uow.audit({ action: 'family.delete', targetType: 'family', targetId: familyId, ...meta });
   });
 }
 
@@ -112,6 +98,13 @@ export async function listMembers(familyId: string, includeDisabled = false) {
   return members.map(toMemberDto);
 }
 
+async function loadMember(familyId: string, targetUserId: string) {
+  const target = await prisma.familyMember.findUnique({
+    where: { familyId_userId: { familyId, userId: targetUserId } },
+  });
+  return assertFound(target, '成员不存在');
+}
+
 export async function updateMemberRole(
   actor: { id: string; role: FamilyRole },
   familyId: string,
@@ -119,31 +112,23 @@ export async function updateMemberRole(
   role: FamilyRole,
   meta: ActorMeta,
 ) {
-  const target = await prisma.familyMember.findUnique({
-    where: { familyId_userId: { familyId, userId: targetUserId } },
-  });
-  if (!target) throw notFound('成员不存在');
+  const target = await loadMember(familyId, targetUserId);
   if (!canManageMember(actor.role, target.role)) throw forbidden('你不能修改该成员的权限');
   if (!canAssignRole(actor.role, role)) throw forbidden('你不能授予该角色');
   if (target.role === 'owner') throw forbidden('不能修改家庭创建者的角色');
 
-  return prisma.$transaction(async (tx) => {
-    const updated = await tx.familyMember.update({
+  return withUnitOfWork({ familyId, actorId: actor.id }, async (uow) => {
+    const updated = await uow.tx.familyMember.update({
       where: { familyId_userId: { familyId, userId: targetUserId } },
       data: { role, status: 'active' },
     });
-    await audit.record(
-      {
-        familyId,
-        actorId: actor.id,
-        action: 'member.update_role',
-        targetType: 'user',
-        targetId: targetUserId,
-        diff: audit.diffOf({ role: target.role, status: target.status }, { role, status: 'active' }),
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'member.update_role',
+      targetType: 'user',
+      targetId: targetUserId,
+      diff: diffOf({ role: target.role, status: target.status }, { role, status: 'active' }),
+      ...meta,
+    });
     return updated;
   });
 }
@@ -155,35 +140,27 @@ export async function setMemberStatus(
   status: 'active' | 'disabled',
   meta: ActorMeta,
 ) {
-  const target = await prisma.familyMember.findUnique({
-    where: { familyId_userId: { familyId, userId: targetUserId } },
-  });
-  if (!target) throw notFound('成员不存在');
+  const target = await loadMember(familyId, targetUserId);
   if (!canManageMember(actor.role, target.role)) throw forbidden('你不能修改该成员的状态');
 
-  await prisma.$transaction(async (tx) => {
-    await tx.familyMember.update({
+  await withUnitOfWork({ familyId, actorId: actor.id }, async (uow) => {
+    await uow.tx.familyMember.update({
       where: { familyId_userId: { familyId, userId: targetUserId } },
       data: { status },
     });
     if (status === 'disabled') {
-      await tx.refreshToken.updateMany({
+      await uow.tx.refreshToken.updateMany({
         where: { userId: targetUserId, revokedAt: null },
         data: { revokedAt: new Date() },
       });
     }
-    await audit.record(
-      {
-        familyId,
-        actorId: actor.id,
-        action: 'member.update_role',
-        targetType: 'user',
-        targetId: targetUserId,
-        diff: audit.diffOf({ status: target.status }, { status }),
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'member.update_role',
+      targetType: 'user',
+      targetId: targetUserId,
+      diff: diffOf({ status: target.status }, { status }),
+      ...meta,
+    });
   });
 }
 
@@ -193,33 +170,25 @@ export async function removeMember(
   targetUserId: string,
   meta: ActorMeta,
 ) {
-  const target = await prisma.familyMember.findUnique({
-    where: { familyId_userId: { familyId, userId: targetUserId } },
-  });
-  if (!target) throw notFound('成员不存在');
+  const target = await loadMember(familyId, targetUserId);
   if (!canManageMember(actor.role, target.role)) throw forbidden('你不能移除该成员');
 
-  await prisma.$transaction(async (tx) => {
-    await tx.familyMember.delete({ where: { familyId_userId: { familyId, userId: targetUserId } } });
+  await withUnitOfWork({ familyId, actorId: actor.id }, async (uow) => {
+    await uow.tx.familyMember.delete({ where: { familyId_userId: { familyId, userId: targetUserId } } });
     // 清掉该成员在这个家庭里的条目级授权，避免残留
-    await tx.itemShare.deleteMany({ where: { userId: targetUserId, item: { familyId } } });
+    await uow.tx.itemShare.deleteMany({ where: { userId: targetUserId, item: { familyId } } });
     // 会话与家庭无关，直接撤销该用户全部登录态，保证被移除后立即失效
-    await tx.refreshToken.updateMany({
+    await uow.tx.refreshToken.updateMany({
       where: { userId: targetUserId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
-    await audit.record(
-      {
-        familyId,
-        actorId: actor.id,
-        action: 'member.remove',
-        targetType: 'user',
-        targetId: targetUserId,
-        diff: { role: target.role } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'member.remove',
+      targetType: 'user',
+      targetId: targetUserId,
+      diff: { role: target.role } as Prisma.InputJsonValue,
+      ...meta,
+    });
   });
 }
 
@@ -234,8 +203,8 @@ export async function createInvite(
   const code = randomToken(18);
   const expiresAt = new Date(Date.now() + input.expiresInDays * 86_400_000);
 
-  const invite = await prisma.$transaction(async (tx) => {
-    const created = await tx.invite.create({
+  const invite = await withUnitOfWork({ familyId, actorId }, async (uow) => {
+    const created = await uow.tx.invite.create({
       data: {
         familyId,
         codeHash: sha256Hex(code),
@@ -246,18 +215,13 @@ export async function createInvite(
         createdBy: actorId,
       },
     });
-    await audit.record(
-      {
-        familyId,
-        actorId,
-        action: 'member.invite',
-        targetType: 'invite',
-        targetId: created.id,
-        diff: { role: input.role, maxUses: input.maxUses } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'member.invite',
+      targetType: 'invite',
+      targetId: created.id,
+      diff: { role: input.role, maxUses: input.maxUses } as Prisma.InputJsonValue,
+      ...meta,
+    });
     return created;
   });
 
@@ -270,15 +234,29 @@ export async function listInvites(familyId: string) {
 }
 
 export async function revokeInvite(actorId: string, familyId: string, inviteId: string, meta: ActorMeta) {
-  const invite = await prisma.invite.findFirst({ where: { id: inviteId, familyId } });
-  if (!invite) throw notFound('邀请不存在');
-  await prisma.$transaction(async (tx) => {
-    await tx.invite.update({ where: { id: inviteId }, data: { revokedAt: new Date() } });
-    await audit.record(
-      { familyId, actorId, action: 'member.invite', targetType: 'invite', targetId: inviteId, diff: { revoked: true } as Prisma.InputJsonValue, ...meta },
-      tx,
-    );
+  await assertInviteInFamily(familyId, inviteId);
+  await withUnitOfWork({ familyId, actorId }, async (uow) => {
+    await uow.tx.invite.update({ where: { id: inviteId }, data: { revokedAt: new Date() } });
+    await uow.audit({
+      action: 'member.invite',
+      targetType: 'invite',
+      targetId: inviteId,
+      diff: { revoked: true } as Prisma.InputJsonValue,
+      ...meta,
+    });
   });
+}
+
+async function assertInviteInFamily(familyId: string, inviteId: string): Promise<Invite> {
+  const invite = await prisma.invite.findFirst({ where: { id: inviteId, familyId } });
+  return assertFound(invite, '邀请不存在');
+}
+
+/** 邀请可用性校验，preview / accept 共用，保证两条路径判定一致。 */
+function assertInviteUsable(invite: Invite): void {
+  if (invite.revokedAt) throw conflict('邀请已被撤销');
+  if (invite.expiresAt.getTime() < Date.now()) throw conflict('邀请已过期');
+  if (invite.usedCount >= invite.maxUses) throw conflict('邀请使用次数已用尽');
 }
 
 export async function previewInvite(code: string) {
@@ -287,9 +265,7 @@ export async function previewInvite(code: string) {
     include: { family: { select: { id: true, name: true, description: true } } },
   });
   if (!invite) throw notFound('邀请链接无效');
-  if (invite.revokedAt) throw conflict('邀请已被撤销');
-  if (invite.expiresAt.getTime() < Date.now()) throw conflict('邀请已过期');
-  if (invite.usedCount >= invite.maxUses) throw conflict('邀请使用次数已用尽');
+  assertInviteUsable(invite);
   return {
     familyId: invite.familyId,
     familyName: invite.family.name,
@@ -303,9 +279,7 @@ export async function previewInvite(code: string) {
 export async function acceptInvite(userId: string, code: string, meta: ActorMeta) {
   const invite = await prisma.invite.findUnique({ where: { codeHash: sha256Hex(code) } });
   if (!invite) throw notFound('邀请链接无效');
-  if (invite.revokedAt) throw conflict('邀请已被撤销');
-  if (invite.expiresAt.getTime() < Date.now()) throw conflict('邀请已过期');
-  if (invite.usedCount >= invite.maxUses) throw conflict('邀请使用次数已用尽');
+  assertInviteUsable(invite);
 
   const existing = await prisma.familyMember.findUnique({
     where: { familyId_userId: { familyId: invite.familyId, userId } },
@@ -314,30 +288,24 @@ export async function acceptInvite(userId: string, code: string, meta: ActorMeta
     return { familyId: invite.familyId, role: existing.role, alreadyMember: true };
   }
 
-  return prisma.$transaction(async (tx) => {
+  return withUnitOfWork({ familyId: invite.familyId, actorId: userId }, async (uow) => {
     // 条件更新兜住并发：只有 used_count < max_uses 时才 +1
-    const bumped = await tx.invite.updateMany({
+    const bumped = await uow.tx.invite.updateMany({
       where: { id: invite.id, usedCount: { lt: invite.maxUses }, revokedAt: null },
       data: { usedCount: { increment: 1 } },
     });
     if (bumped.count === 0) throw conflict('邀请使用次数已用尽');
 
-    await tx.familyMember.create({
+    await uow.tx.familyMember.create({
       data: { familyId: invite.familyId, userId, role: invite.role },
     });
-    await audit.record(
-      {
-        familyId: invite.familyId,
-        actorId: userId,
-        action: 'member.join',
-        targetType: 'user',
-        targetId: userId,
-        diff: { role: invite.role } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'member.join',
+      targetType: 'user',
+      targetId: userId,
+      diff: { role: invite.role } as Prisma.InputJsonValue,
+      ...meta,
+    });
     return { familyId: invite.familyId, role: invite.role, alreadyMember: false };
   });
 }
-

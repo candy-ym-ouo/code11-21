@@ -3,14 +3,11 @@ import { prisma } from '../db';
 import { notFound, unauthenticated } from '../http/errors';
 import { randomToken, sha256Hex } from '../utils/crypto';
 import { hashPassword, verifyPassword } from './authService';
-import * as audit from './auditService';
+import { assertFound, withUnitOfWork, type ActorMeta } from './unitOfWork';
 import { toItemDto, toShareLinkDto } from '../serializers';
 import { itemWithAccess, type FamilyContext } from './permissionService';
 
-export interface ActorMeta {
-  ip?: string | null;
-  userAgent?: string | null;
-}
+export type { ActorMeta };
 
 export async function createShareLink(
   userId: string,
@@ -27,8 +24,8 @@ export async function createShareLink(
   const passwordHash = input.password ? await hashPassword(input.password) : null;
   const expiresAt = new Date(Date.now() + input.expiresInDays * 86_400_000);
 
-  const link = await prisma.$transaction(async (tx) => {
-    const created = await tx.shareLink.create({
+  const link = await withUnitOfWork({ familyId: ctx.familyId, actorId: userId }, async (uow) => {
+    const created = await uow.tx.shareLink.create({
       data: {
         familyId: ctx.familyId,
         tokenHash: sha256Hex(token),
@@ -39,18 +36,13 @@ export async function createShareLink(
         items: { create: input.itemIds.map((itemId) => ({ itemId })) },
       },
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'share.create',
-        targetType: 'share_link',
-        targetId: created.id,
-        diff: { itemCount: input.itemIds.length, expiresAt: expiresAt.toISOString() } as Prisma.InputJsonValue,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'share.create',
+      targetType: 'share_link',
+      targetId: created.id,
+      diff: { itemCount: input.itemIds.length, expiresAt: expiresAt.toISOString() } as Prisma.InputJsonValue,
+      ...meta,
+    });
     return created;
   });
 
@@ -67,21 +59,18 @@ export async function listShareLinks(ctx: FamilyContext) {
 }
 
 export async function revokeShareLink(actorId: string, ctx: FamilyContext, linkId: string, meta: ActorMeta) {
-  const link = await prisma.shareLink.findFirst({ where: { id: linkId, familyId: ctx.familyId } });
-  if (!link) throw notFound('分享链接不存在');
-  await prisma.$transaction(async (tx) => {
-    await tx.shareLink.update({ where: { id: linkId }, data: { revokedAt: new Date() } });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId,
-        action: 'share.revoke',
-        targetType: 'share_link',
-        targetId: linkId,
-        ...meta,
-      },
-      tx,
-    );
+  await assertFound(
+    await prisma.shareLink.findFirst({ where: { id: linkId, familyId: ctx.familyId } }),
+    '分享链接不存在',
+  );
+  await withUnitOfWork({ familyId: ctx.familyId, actorId }, async (uow) => {
+    await uow.tx.shareLink.update({ where: { id: linkId }, data: { revokedAt: new Date() } });
+    await uow.audit({
+      action: 'share.revoke',
+      targetType: 'share_link',
+      targetId: linkId,
+      ...meta,
+    });
   });
 }
 

@@ -10,34 +10,26 @@ import { logger } from '../logger';
 import { notFound } from '../http/errors';
 import { absOf } from '../storage/local';
 import { slugify } from '../utils/crypto';
-import * as audit from './auditService';
+import { withUnitOfWork, type ActorMeta } from './unitOfWork';
 import type { FamilyContext } from './permissionService';
 
-export interface ActorMeta {
-  ip?: string | null;
-  userAgent?: string | null;
-}
+export type { ActorMeta };
 
 export async function createExportJob(userId: string, ctx: FamilyContext, meta: ActorMeta) {
-  const job = await prisma.$transaction(async (tx) => {
-    const created = await tx.job.create({
+  const job = await withUnitOfWork({ familyId: ctx.familyId, actorId: userId }, async (uow) => {
+    const created = await uow.tx.job.create({
       data: {
         familyId: ctx.familyId,
         type: 'export_build',
         payload: { requestedBy: userId } as never,
       },
     });
-    await audit.record(
-      {
-        familyId: ctx.familyId,
-        actorId: userId,
-        action: 'export.create',
-        targetType: 'job',
-        targetId: created.id,
-        ...meta,
-      },
-      tx,
-    );
+    await uow.audit({
+      action: 'export.create',
+      targetType: 'job',
+      targetId: created.id,
+      ...meta,
+    });
     return created;
   });
   return { jobId: job.id, status: job.status };
